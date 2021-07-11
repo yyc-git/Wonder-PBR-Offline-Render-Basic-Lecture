@@ -1,0 +1,53 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#pragma shader_stage(raygen)
+
+layout(location = 0) rayPayloadEXT vec3 payload;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
+
+layout(std140, set = 0, binding = 1) buffer PixelBuffer { vec4 pixels[]; }
+pixelBuffer;
+
+layout(std140, set = 0, binding = 2) uniform Camera {
+  mat4 viewInverse;
+  mat4 projectionInverse;
+  float near;
+  float far;
+  float pad_0;
+  float pad_1;
+}
+uCamera;
+
+void main() {
+  const ivec2 ipos = ivec2(gl_LaunchIDEXT.xy);
+  const ivec2 resolution = ivec2(gl_LaunchSizeEXT.xy);
+
+  vec4 origin = uCamera.viewInverse * vec4(0, 0, 0, 1);
+
+  const vec2 pixel = vec2(ipos.x, ipos.y);
+  const vec2 uv = (pixel / resolution) * 2.0 - 1.0;
+
+  vec4 target = uCamera.projectionInverse * (vec4(uv.x, uv.y, -1, 1));
+  vec4 direction =
+      normalize(uCamera.viewInverse * vec4(normalize(target.xyz), 0));
+
+  payload = vec3(0.0);
+
+  const uint cullMask = 0xFF;
+  traceRayEXT(topLevelAS,           // acceleration structure
+              gl_RayFlagsOpaqueEXT, // rayFlags
+              cullMask,             // cullMask
+              0,                    // sbtRecordOffset
+              0,                    // sbtRecordStride
+              0,                    // missIndex
+              origin.xyz,           // ray origin
+              uCamera.near,         // ray min range
+              direction.xyz,        // ray direction
+              uCamera.far,          // ray max range
+              0                     // payload (location = 0)
+  );
+
+  const uint pixelIndex = ipos.y * resolution.x + ipos.x;
+  pixelBuffer.pixels[pixelIndex] = vec4(payload, 1.0);
+}

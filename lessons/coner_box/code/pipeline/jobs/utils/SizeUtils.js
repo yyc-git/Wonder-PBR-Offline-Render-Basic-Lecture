@@ -1,0 +1,1 @@
+export let getWindowSize = (window) => [window.width, window.height];

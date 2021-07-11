@@ -1,0 +1,533 @@
+#version 450
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_scalar_block_layout : enable
+#pragma shader_stage(compute)
+
+#define PI 3.141592653589793
+
+#define TWO_PI 6.283185307179586
+
+#define POSITIVE_INFINITY 10000000
+
+struct AccelerationStructure {
+  vec4 worldMin;
+  vec4 worldMax;
+
+  vec4 p0WorldPosition;
+  vec4 p1WorldPosition;
+  vec4 p2WorldPosition;
+
+  float primitiveIndex;
+  float instanceIndex;
+  float pad_0;
+  float pad_1;
+};
+layout(std140, set = 0, binding = 0) buffer SceneAccelerationStructure {
+  AccelerationStructure a[];
+}
+sceneAccelerationStructure;
+
+struct Instance {
+  float geometryIndex;
+  float materialIndex;
+  float pad_0;
+  float pad_1;
+
+  mat3 normalMatrix;
+  // mat4 modelMatrix;
+};
+
+struct Vertex {
+  // vec4 position;
+  // vec4 texCoord;
+  vec4 normal;
+  // vec4 tangent;
+};
+
+/*!
+extract this to avoid duplicate instead of move this into Instance
+*/
+struct PointIndexData {
+  uint vertexIndex;
+  uint faceIndex;
+};
+
+struct BRDFMaterial {
+  vec3 diffuse;
+  float isRectAreaLight;
+};
+
+layout(std140, set = 0, binding = 1) buffer SceneDesc { Instance i[]; }
+sceneDesc;
+
+layout(scalar, set = 0, binding = 2) buffer ScenePointIndexData {
+  PointIndexData o[];
+}
+scenePointIndexData;
+
+layout(scalar, set = 0, binding = 3) buffer Vertices { Vertex v[]; }
+vertices;
+layout(scalar, set = 0, binding = 4) buffer Indices { uint i[]; }
+indices;
+
+layout(std140, set = 0, binding = 5) buffer BRDFMaterials { BRDFMaterial m[]; }
+materials;
+
+layout(std140, set = 0, binding = 6) uniform RectAreaLight { vec4 lemit; }
+uRectAreaLight;
+
+layout(std140, set = 0, binding = 7) buffer PixelBuffer { vec4 pixels[]; }
+pixelBuffer;
+
+layout(std140, set = 0, binding = 8) uniform Camera {
+  mat4 viewInverse;
+  mat4 projectionInverse;
+  float near;
+  float far;
+  float pad_0;
+  float pad_1;
+}
+uCamera;
+
+layout(std140, set = 0, binding = 9) uniform ScreenDimension {
+  vec2 resolution;
+}
+screenDimension;
+
+layout(std140, set = 0, binding = 10) uniform CommonData {
+  uint sampleCountPerPixel;
+  uint totalSampleCount;
+  uint pad_0;
+  uint pad_1;
+}
+pushC;
+
+struct Ray {
+  vec3 origin;
+  vec3 direction;
+  float tMin;
+  float tMax;
+};
+
+struct RayPayload {
+  vec3 radiance;
+  float t;
+  vec3 scatterDirection;
+  vec3 throughput;
+  uint seed;
+  vec3 bias;
+};
+
+struct TriangleIntersect {
+  float t;
+  vec3 barycentric;
+  bool isClosestHit;
+  float primitiveIndex;
+  float instanceIndex;
+};
+
+struct AABB {
+  vec3 min;
+  vec3 max;
+};
+
+struct Triangle {
+  vec3 p0WorldPosition;
+  vec3 p1WorldPosition;
+  vec3 p2WorldPosition;
+};
+
+// Generate a random unsigned int from two unsigned int values, using 16 pairs
+// of rounds of the Tiny Encryption Algorithm. See Zafar, Olano, and Curtis,
+// "GPU Random Numbers via the Tiny Encryption Algorithm"
+uint tea(uint val0, uint val1) {
+  uint v0 = val0;
+  uint v1 = val1;
+  uint s0 = 0;
+
+  for (uint n = 0; n < 16; n++) {
+    s0 += 0x9e3779b9;
+    v0 += ((v1 << 4) + 0xa341316c) ^ (v1 + s0) ^ ((v1 >> 5) + 0xc8013ea4);
+    v1 += ((v0 << 4) + 0xad90777d) ^ (v0 + s0) ^ ((v0 >> 5) + 0x7e95761e);
+  }
+
+  return v0;
+}
+
+// Generate a random unsigned int in [0, 2^24) given the previous RNG state
+// using the Numerical Recipes linear congruential generator
+uint lcg(inout uint prev) {
+  uint LCG_A = 1664525u;
+  uint LCG_C = 1013904223u;
+  prev = (LCG_A * prev + LCG_C);
+  return prev & 0x00FFFFFF;
+}
+
+// Generate a random float in [0, 1) given the previous RNG state
+float rnd(inout uint prev) { return (float(lcg(prev)) / float(0x01000000)); }
+
+vec2 randInUnitDisk(inout uint seed) {
+  vec2 p = vec2(0);
+  do {
+    p = 2 * vec2(rnd(seed), rnd(seed)) - 1;
+  } while (dot(p, p) >= 1);
+  return p;
+}
+
+Instance _getInstance(uint instanceIndex) { return sceneDesc.i[instanceIndex]; }
+
+BRDFMaterial _getMaterial(uint materialIndex) {
+  return materials.m[materialIndex];
+}
+
+void _swap(inout float a, inout float b) {
+  float temp = a;
+  a = b;
+  b = temp;
+}
+
+bool _isIntersectWithAABB(Ray ray, AABB aabb) {
+  vec3 min = aabb.min;
+  vec3 max = aabb.max;
+
+  vec3 origin = ray.origin;
+  vec3 direction = ray.direction;
+
+  float tmin = (min.x - origin.x) / direction.x;
+  float tmax = (max.x - origin.x) / direction.x;
+
+  if (tmin > tmax)
+    _swap(tmin, tmax);
+
+  float tymin = (min.y - origin.y) / direction.y;
+  float tymax = (max.y - origin.y) / direction.y;
+
+  if (tymin > tymax)
+    _swap(tymin, tymax);
+
+  if ((tmin > tymax) || (tymin > tmax))
+    return false;
+
+  if (tymin > tmin)
+    tmin = tymin;
+
+  if (tymax < tmax)
+    tmax = tymax;
+
+  float tzmin = (min.z - origin.z) / direction.z;
+  float tzmax = (max.z - origin.z) / direction.z;
+
+  if (tzmin > tzmax)
+    _swap(tzmin, tzmax);
+
+  if ((tmin > tzmax) || (tzmin > tmax))
+    return false;
+
+  if (tzmin > tmin)
+    tmin = tzmin;
+
+  if (tzmax < tmax)
+    tmax = tzmax;
+
+  return true;
+}
+
+vec4 _getBarycentricAndT(Ray ray, Triangle tri) {
+  vec3 e1 = tri.p1WorldPosition - tri.p0WorldPosition;
+  vec3 e2 = tri.p2WorldPosition - tri.p0WorldPosition;
+  vec3 s = ray.origin - tri.p0WorldPosition;
+  vec3 s1 = cross(ray.direction, e2);
+  vec3 s2 = cross(s, e1);
+
+  vec3 result =
+      1 / dot(s1, e1) * vec3(dot(s2, e2), dot(s1, s), dot(s2, ray.direction));
+
+  float t = result.x;
+  float b1 = result.y;
+  float b2 = result.z;
+  float b0 = 1 - b1 - b2;
+
+  return vec4(b0, b1, b2, t);
+}
+
+bool _isIntersectWithTriangle(vec3 barycentric) {
+  return barycentric.x >= 0 && barycentric.y >= 0 && barycentric.z >= 0;
+}
+
+TriangleIntersect _intersectScene(in Ray ray) {
+  TriangleIntersect intersectResult;
+
+  intersectResult.isClosestHit = false;
+  intersectResult.t = POSITIVE_INFINITY;
+
+  for (int i = 0; i < sceneAccelerationStructure.a.length(); i++) {
+    AccelerationStructure as = sceneAccelerationStructure.a[i];
+
+    if (_isIntersectWithAABB(ray, AABB(as.worldMin.xyz, as.worldMax.xyz))) {
+      vec4 barycentricAndT = _getBarycentricAndT(
+          ray, Triangle(as.p0WorldPosition.xyz, as.p1WorldPosition.xyz,
+                        as.p2WorldPosition.xyz));
+      vec3 barycentric = barycentricAndT.xyz;
+      float t = barycentricAndT.w;
+
+      if (_isIntersectWithTriangle(barycentric)) {
+        if (t >= 0.0 &&
+            (!intersectResult.isClosestHit || (t < intersectResult.t))) {
+          intersectResult.isClosestHit = true;
+          intersectResult.barycentric = barycentric;
+          intersectResult.t = t;
+          intersectResult.primitiveIndex = as.primitiveIndex;
+          intersectResult.instanceIndex = as.instanceIndex;
+        }
+      }
+    }
+  }
+
+  // ensure: intersectResult.t >= 0.0
+
+  return intersectResult;
+}
+
+bool _isHitEmitInstance(BRDFMaterial mat) { return bool(mat.isRectAreaLight); }
+
+vec3 _getRectAreaLightLe() { return uRectAreaLight.lemit.rgb; }
+
+void _buildTBN(in vec3 n, out vec3 t, out vec3 b) {
+  const vec3 u = abs(n.z) > 0.999 ? vec3(1, 0, 0) : vec3(0, 0, 1);
+  t = normalize(cross(u, n));
+  b = cross(n, t);
+}
+
+vec3 _cosineSampleHemisphereInSphereCoordinateSystem(float r1, float r2,
+                                                     vec3 n) {
+  float phi = TWO_PI * r1;
+  float sinTheta = sqrt(r2);
+  float x = cos(phi) * sinTheta;
+  float y = sin(phi) * sinTheta;
+  float z = sqrt(max(0.0, 1.0 - r2));
+
+  // float r = sqrt(r1);
+  // float phi = TWO_PI * r2;
+  // float x = r * cos(phi);
+  // float y = r * sin(phi);
+  // float z = sqrt(max(0.0, 1.0 - x * x - y * y));
+
+  vec3 t;
+  vec3 b;
+  _buildTBN(n, t, b);
+
+  return t * x + b * y + n * z;
+}
+
+PointIndexData _getPointIndexData(uint geometryIndex) {
+  return scenePointIndexData.o[geometryIndex];
+}
+
+uint _getVertexIndex(PointIndexData pointIndexData) {
+  return pointIndexData.vertexIndex;
+}
+
+uint _getFaceIndex(PointIndexData pointIndexData) {
+  return pointIndexData.faceIndex;
+}
+
+ivec3 _getTriangleIndices(uint faceIndex, uint primitiveIndex) {
+  return ivec3(indices.i[faceIndex + 3 * primitiveIndex + 0],
+               indices.i[faceIndex + 3 * primitiveIndex + 1],
+               indices.i[faceIndex + 3 * primitiveIndex + 2]);
+}
+
+Vertex _getTriangleVertex(uint vertexIndex, uint index) {
+  return vertices.v[vertexIndex + index];
+}
+
+void _getVertices(in uint instanceIndex, in uint primitiveIndex, out Vertex v0,
+                  out Vertex v1, out Vertex v2) {
+  Instance instance = _getInstance(instanceIndex);
+
+  uint geometryIndex = uint(instance.geometryIndex);
+
+  PointIndexData pointIndexData = _getPointIndexData(geometryIndex);
+  uint vertexIndex = _getVertexIndex(pointIndexData);
+  uint faceIndex = _getFaceIndex(pointIndexData);
+
+  // Indices of the triangle
+  ivec3 ind = _getTriangleIndices(faceIndex, primitiveIndex);
+
+  // Vertex of the triangle
+  v0 = _getTriangleVertex(vertexIndex, ind.x);
+  v1 = _getTriangleVertex(vertexIndex, ind.y);
+  v2 = _getTriangleVertex(vertexIndex, ind.z);
+}
+
+vec3 _blerp(vec3 barycentric, vec3 p1, vec3 p2, vec3 p3) {
+  return barycentric.z * p1 + barycentric.x * p2 + barycentric.y * p3;
+}
+
+// vec3 _getBRDFMaterialLe(BRDFMaterial mat) { return mat.diffuse; }
+vec3 _getBRDFMaterialLe() { return vec3(0.0); }
+
+float _cosinSamplePDF(float NdotL) { return NdotL / PI; }
+
+float _computeBRDFPdf(float NdotL) { return _cosinSamplePDF(NdotL); }
+
+vec3 _evalBRDF(vec3 albedo) { return albedo / PI; }
+
+bool _isFromOutside(vec3 wo, vec3 n) { return dot(wo, n) > 0.0; }
+
+bool _handleRayClosestHit(inout RayPayload payload, in vec3 rayDirection,
+                          in TriangleIntersect intersectResult) {
+  payload.t = intersectResult.t;
+
+  uint primitiveIndex = uint(intersectResult.primitiveIndex);
+  uint instanceIndex = uint(intersectResult.instanceIndex);
+
+  Instance instance = _getInstance(instanceIndex);
+
+  Vertex v0;
+  Vertex v1;
+  Vertex v2;
+
+  _getVertices(instanceIndex, primitiveIndex, v0, v1, v2);
+
+  const vec3 n0 = v0.normal.xyz, n1 = v1.normal.xyz, n2 = v2.normal.xyz;
+
+  vec3 n = _blerp(intersectResult.barycentric, n0.xyz, n1.xyz, n2.xyz);
+
+  mat3 normalMatrix = instance.normalMatrix;
+
+  n = normalize(normalMatrix * n);
+
+  payload.bias = 0.001 * (_isFromOutside(-rayDirection, n) ? n : -n);
+
+  uint materialIndex = uint(instance.materialIndex);
+
+  BRDFMaterial mat = _getMaterial(materialIndex);
+
+  if (_isHitEmitInstance(mat)) {
+    payload.radiance += _getRectAreaLightLe() * payload.throughput;
+
+    return false;
+  } else {
+    vec3 wi = _cosineSampleHemisphereInSphereCoordinateSystem(
+        rnd(payload.seed), rnd(payload.seed), n);
+
+    payload.radiance += _getBRDFMaterialLe() * payload.throughput;
+    payload.scatterDirection = wi;
+
+    const float NdotL = abs(dot(wi, n));
+
+    payload.throughput *=
+        _evalBRDF(mat.diffuse) * NdotL / _computeBRDFPdf(NdotL);
+
+    return true;
+  }
+}
+
+vec3 _getEnvLE() { return vec3(0.0, 0.0, 0.0); }
+
+bool _handleRayMiss(inout RayPayload payload) {
+  payload.radiance += _getEnvLE() * payload.throughput;
+  payload.t = -1.0;
+
+  return false;
+}
+
+bool _traceRay(in Ray ray, inout RayPayload payload) {
+  TriangleIntersect intersectResult = _intersectScene(ray);
+
+  if (intersectResult.isClosestHit) {
+    return _handleRayClosestHit(payload, ray.direction, intersectResult);
+  }
+
+  return _handleRayMiss(payload);
+}
+
+float _luminance(vec3 color) {
+  return 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+}
+
+float _weight(vec2 pixelDiff) { return 1.0; }
+
+void main() {
+  const ivec2 ipos = ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
+  const ivec2 resolution = ivec2(screenDimension.resolution);
+
+  const uint sampleCountPerPixel = pushC.sampleCountPerPixel;
+  const uint totalSampleCount = pushC.totalSampleCount;
+
+  RayPayload payload;
+  payload.seed = tea(tea(ipos.x, ipos.y), totalSampleCount);
+
+  vec3 pixelColor = vec3(0.0, 0.0, 0.0);
+  float weightSum = 0.0;
+
+  for (uint j = 0; j < sampleCountPerPixel; j++) {
+    // for (uint j = 0; j < 1; j++) {
+    vec4 origin = uCamera.viewInverse * vec4(0, 0, 0, 1);
+
+    const vec2 pixel = vec2(ipos.x, ipos.y);
+    const vec2 sampledPixel =
+        vec2(ipos.x + rnd(payload.seed), ipos.y + rnd(payload.seed));
+    vec2 pixelDiff = sampledPixel - pixel;
+
+    const vec2 uv = (sampledPixel / resolution) * 2.0 - 1.0;
+
+    vec4 target = uCamera.projectionInverse * (vec4(uv.x, uv.y, -1, 1));
+    vec4 direction =
+        normalize(uCamera.viewInverse * vec4(normalize(target.xyz), 0));
+
+    vec3 wi = direction.xyz;
+
+    payload.radiance = vec3(0.0, 0.0, 0.0);
+    payload.throughput = vec3(1.0, 1.0, 1.0);
+    payload.scatterDirection = vec3(0.0, 0.0, 0.0);
+    payload.t = -1.0;
+    payload.bias = vec3(0.0, 0.0, 0.0);
+
+    // uint bounceIndex = 0;
+    // const uint minBounceCount = 12;
+
+    while (true) {
+      bool isContinueBounce =
+          _traceRay(Ray(origin.xyz, wi, uCamera.near, uCamera.far), payload);
+
+      if (!isContinueBounce) {
+        break;
+      }
+
+      // if (bounceIndex >= 6) {
+      //   payload.radiance += _getBRDFMaterialLe() * payload.throughput;
+      //   break;
+      // }
+
+      // bounceIndex += 1;
+
+      // if (bounceIndex >= minBounceCount) {
+      float ksi = rnd(payload.seed);
+      float p_rr = _luminance(payload.throughput);
+      if (ksi > p_rr) {
+        break;
+      } else {
+        payload.throughput /= p_rr;
+      }
+      // }
+
+      // bounceIndex += 1;
+
+      // move the ray
+      origin = origin + payload.t * vec4(wi, 0.0) + vec4(payload.bias, 0.0);
+      wi = payload.scatterDirection;
+    }
+
+    pixelColor += _weight(pixelDiff) * payload.radiance;
+
+    weightSum += _weight(pixelDiff);
+  }
+
+  pixelColor /= weightSum;
+
+  const uint pixelIndex = ipos.y * resolution.x + ipos.x;
+  pixelBuffer.pixels[pixelIndex] =
+      vec4(pixelBuffer.pixels[pixelIndex].rgb + pixelColor, 1.0);
+}

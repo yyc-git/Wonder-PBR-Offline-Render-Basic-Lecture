@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>draw</title>
+</head>
+
+<body>
+
+    <script type="module">
+        import * as THREE from "https://threejs.org/build/three.module.js";
+        import { OrbitControls } from "https://threejs.org/examples/jsm/controls/OrbitControls.js";
+
+        // import { uniformSampleHemisphereInSphereCoordinateSystem } from "../monte_in_sphere_coordinate_system.js";
+
+        let camera, controls, scene, renderer;
+
+        init();
+        animate();
+
+        function init() {
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.00001, 10);
+            camera.position.z = 4;
+
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+
+            // controls
+
+            controls = new OrbitControls(camera, renderer.domElement);
+
+            //controls.addEventListener( 'change', render ); // call this only in static scenes (i.e., if there is no animation loop)
+
+            controls.enableDamping = true; // an animation loop is required when either damping or auto-rotation are enabled
+            controls.dampingFactor = 0.05;
+
+            controls.screenSpacePanning = false;
+
+            controls.minDistance = 0.00001;
+            controls.maxDistance = 10;
+
+            // controls.maxPolarAngle = Math.PI / 2;
+
+
+
+
+            scene = new THREE.Scene();
+
+
+            // TODO 修改这里：
+
+            let radius = 0.05;
+
+            const geometry = new THREE.SphereBufferGeometry(radius);
+            const material = new THREE.MeshBasicMaterial({ color: 0x9370DB });
+
+            let mesh = new THREE.Mesh(geometry, material);
+            mesh.position.set(0, 0, 0);
+
+            scene.add(mesh);
+        }
+
+        function animate() {
+
+            requestAnimationFrame(animate);
+
+            controls.update(); // only required if controls.enableDamping = true, or if controls.autoRotate = true
+
+            renderer.render(scene, camera);
+
+        }
+
+    </script>
+
+</body>
+
+</html>
